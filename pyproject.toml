@@ -47,19 +47,13 @@ dependencies = [
 
     # Data processing
     "numpy>=1.24.0",
-    "pandas>=2.0.0",
 
-    # Configuration
-    "pyyaml>=6.0",
+    # Validation / config-less settings models still used by API layer
     "pydantic>=2.0.0",
 
     # CLI
     "click>=8.1.0",
     "rich>=13.0.0",
-    "tqdm>=4.65.0",
-
-    # Database for metadata storage
-    "sqlalchemy>=2.0.0",
 
     # Utilities
     "pathspec>=0.11.0",
@@ -69,10 +63,16 @@ dependencies = [
 dev = [
     "pytest>=7.3.0",
     "pytest-cov>=4.1.0",
-    "black>=23.0.0",
-    "isort>=5.12.0",
-    "mypy>=1.3.0",
-    "ruff>=0.0.270",
+    "ruff>=0.5.0",
+    "pyright>=1.1.0",
+    "mutmut>=3.0.0",
+]
+
+# HTTP plugin server (plugin_server.py). Install with:
+#   uv sync --extra plugin
+plugin = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
 ]
 
 gpu = [
@@ -95,21 +95,11 @@ Homepage = "https://github.com/structurelint/structurelint"
 Repository = "https://github.com/structurelint/structurelint"
 Issues = "https://github.com/structurelint/structurelint/issues"
 
-[tool.setuptools]
-packages = ["clone_detection"]
+[tool.setuptools.packages.find]
+include = ["clone_detection*"]
 
 [tool.setuptools.package-data]
-clone_detection = ["py.typed", "config/*.yaml"]
-
-[tool.black]
-line-length = 100
-target-version = ['py38', 'py39', 'py310', 'py311']
-include = '\.pyi?$'
-
-[tool.isort]
-profile = "black"
-line_length = 100
-multi_line_output = 3
+clone_detection = ["py.typed"]
 
 [tool.mypy]
 python_version = "3.8"
@@ -123,10 +113,80 @@ testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"
 python_functions = "test_*"
-addopts = "-v --cov=clone_detection --cov-report=term-missing"
+addopts = "-v --cov=clone_detection --cov-branch --cov-fail-under=70 --cov-report=term-missing"
+
+[tool.coverage.run]
+branch = true
+source = ["clone_detection"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
 
 [tool.ruff]
 line-length = 100
-select = ["E", "F", "I", "N", "W", "UP"]
-ignore = ["E501"]
 target-version = "py38"
+
+[tool.ruff.lint]
+# Strict: enable every rule. The ignored rules are either *mutually exclusive*
+# with their counterparts or conflict with the ruff formatter:
+#   - D203 (blank-line-before-class) conflicts with D211 (no-blank-line...).
+#   - D213 (summary-on-second-line) conflicts with D212 (summary-on-first-line).
+#   - COM812 (missing-trailing-comma) conflicts with the ruff formatter; the
+#     formatter owns trailing-comma placement.
+# Picking D211/D212 matches the prevailing numpy/google docstring convention.
+extend-select = ["ALL"]
+ignore = ["D203", "D213", "COM812"]
+
+[tool.ruff.lint.per-file-ignores]
+# `assert` is the correct assertion primitive in pytest tests. PLR0913 is
+# relaxed for test helpers/factories whose argument count is fixed by the
+# CodeSnippet dataclass they construct. SLF001 is relaxed because tests
+# legitimately exercise private helpers (_create_index, _unwrap_ivf_index,
+# _get_index_description, etc.) that are not part of the public API. ARG001 is
+# relaxed because pytest fixtures are frequently requested for their setup
+# side effects (monkeypatching) rather than their return value. PLC0415 is
+# relaxed because fixtures deliberately defer imports (clone_detection.cli.main,
+# clone_detection.indexing.faiss_index) to control module load order.
+"tests/**/*.py" = ["S101", "INP001", "PLR2004", "PLR0913", "SLF001", "ARG001", "ARG005", "PLC0415"]
+# Example/demo scripts legitimately use `print` and bare asserts, and are not a
+# packaged module.
+"examples/**/*.py" = ["T201", "S101", "INP001", "PLR2004", "D103", "D104"]
+# Click commands map one function parameter to one --option decorator; the
+# parameter count is fixed by the CLI surface, not by a refactorable design.
+# Top-level command handlers also catch broad Exception to translate any
+# failure into a non-zero exit + human-readable message.
+"clone_detection/cli/main.py" = ["PLR0913", "PLR0915", "BLE001", "FBT001", "PLC0415"]
+# Index builder is a config object whose constructor genuinely needs all its
+# parameters; boolean flags are keyword-only.
+"clone_detection/indexing/faiss_index.py" = ["PLR0913"]
+# HTTP endpoint and CLI entry points catch broad Exception to translate any
+# failure into a structured response / non-zero exit. Complexity is intrinsic
+# to the request-handling surface, and helper functions carry one parameter
+# per range_search result array. PLC0415 is unavoidable: uvicorn is an
+# optional [plugin] extra whose import is deliberately deferred so the module
+# imports cleanly without it.
+"plugin_server.py" = ["BLE001", "C901", "PLR0915", "PLR0913", "PLC0415"]
+# The package __init__ implements lazy public-symbol loading via __getattr__.
+# PLC0415 (top-level import) is fundamentally incompatible with that pattern:
+# each import is localized to the branch that needs it, gated behind
+# ``name in __all__``, so torch/transformers stay off the import path of
+# lightweight submodules. ANN401 is unavoidable for __getattr__, whose
+# return type is by definition Any (it may return any public symbol).
+"clone_detection/__init__.py" = ["PLC0415", "ANN401"]
+# Same lazy ``__getattr__`` pattern as the package __init__: the
+# GraphCodeBERTEmbedder import is localized to first access so importing
+# ``clone_detection.embeddings`` does not pull in torch/transformers.
+"clone_detection/embeddings/__init__.py" = ["PLC0415", "ANN401"]
+# MetadataStore builds an IN-clause with a dynamic placeholder count. SQL
+# provides no way to parameterize the IN-list structure itself; only `?`/`,`
+# characters are interpolated and all user values are bound via the
+# parameterized second argument, so S608 is a false positive here.
+"clone_detection/query/metadata.py" = ["S608"]
+
+[tool.mutmut]
+paths_to_mutate = [
+    "clone_detection/indexing/faiss_index.py",
+    "clone_detection/query/search.py",
+    "clone_detection/parsers/tree_sitter_parser.py",
+]

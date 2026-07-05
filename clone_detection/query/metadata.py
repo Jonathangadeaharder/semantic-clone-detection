@@ -1,23 +1,27 @@
-"""
-Metadata storage for code snippets.
+"""Metadata storage for code snippets.
 
 This module provides a database layer for storing and retrieving metadata
 associated with code snippets in the FAISS index.
 """
 
+from __future__ import annotations
+
 import logging
 import sqlite3
+import threading
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Self
 
-from clone_detection.parsers.tree_sitter_parser import CodeSnippet
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from clone_detection.parsers.tree_sitter_parser import CodeSnippet
 
 logger = logging.getLogger(__name__)
 
 
 class MetadataStore:
-    """
-    SQLite-based metadata storage for code snippets.
+    """SQLite-based metadata storage for code snippets.
 
     Maps FAISS vector IDs to code snippet metadata (file path, line numbers, etc.).
     This is part of Blueprint A (Batch Ingestion Pipeline) and Blueprint B
@@ -27,30 +31,32 @@ class MetadataStore:
         >>> store = MetadataStore("clones.db")
         >>> store.add_snippet(snippet_id=1, snippet=my_snippet)
         >>> metadata = store.get_snippet(snippet_id=1)
+
     """
 
-    def __init__(self, db_path: str):
-        """
-        Initialize the metadata store.
+    def __init__(self, db_path: str) -> None:
+        """Initialize the metadata store.
 
         Args:
-            db_path: Path to the SQLite database file
+            db_path: Path to the SQLite database file.
+
         """
         self.db_path = str(Path(db_path).resolve())
-        self.conn: Optional[sqlite3.Connection] = None
+        self.conn: sqlite3.Connection | None = None
+        self._write_lock = threading.Lock()
         self._connect()
         self._create_tables()
 
     def _connect(self) -> None:
         """Establish connection to the database."""
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row  # Enable column access by name
-        logger.info(f"Connected to metadata database: {self.db_path}")
+        self.conn.row_factory = sqlite3.Row  # Enable column access by name.
+        logger.info("Connected to metadata database: %s", self.db_path)
 
     def _create_tables(self) -> None:
         """Create the schema for storing code snippet metadata."""
-        with self.conn:
-            self.conn.execute(
+        with self._write_lock, self.conn as conn:
+            conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS snippets (
                     id INTEGER PRIMARY KEY,
@@ -61,36 +67,35 @@ class MetadataStore:
                     language TEXT NOT NULL,
                     function_name TEXT
                 )
-                """
+                """,
             )
 
-            # Create indexes for efficient queries
-            self.conn.execute(
+            # Create indexes for efficient queries.
+            conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_file_path
                 ON snippets(file_path)
-                """
+                """,
             )
-
-            self.conn.execute(
+            conn.execute(
                 """
                 CREATE INDEX IF NOT EXISTS idx_language
                 ON snippets(language)
-                """
+                """,
             )
 
         logger.info("Metadata tables initialized")
 
     def add_snippet(self, snippet_id: int, snippet: CodeSnippet) -> None:
-        """
-        Add a single code snippet to the store.
+        """Add a single code snippet to the store.
 
         Args:
-            snippet_id: Unique ID (must match FAISS index ID)
-            snippet: CodeSnippet object with metadata
+            snippet_id: Unique ID (must match FAISS index ID).
+            snippet: CodeSnippet object with metadata.
+
         """
-        with self.conn:
-            self.conn.execute(
+        with self._write_lock, self.conn as conn:
+            conn.execute(
                 """
                 INSERT OR REPLACE INTO snippets
                 (id, code, file_path, start_line, end_line, language, function_name)
@@ -107,12 +112,15 @@ class MetadataStore:
                 ),
             )
 
-    def add_snippets_batch(self, snippets: List[tuple]) -> None:
-        """
-        Add multiple snippets efficiently.
+    def add_snippets_batch(
+        self,
+        snippets: Sequence[tuple[int, CodeSnippet]],
+    ) -> None:
+        """Add multiple snippets efficiently.
 
         Args:
-            snippets: List of (snippet_id, CodeSnippet) tuples
+            snippets: List of (snippet_id, CodeSnippet) tuples.
+
         """
         data = [
             (
@@ -127,8 +135,8 @@ class MetadataStore:
             for snippet_id, snippet in snippets
         ]
 
-        with self.conn:
-            self.conn.executemany(
+        with self._write_lock, self.conn as conn:
+            conn.executemany(
                 """
                 INSERT OR REPLACE INTO snippets
                 (id, code, file_path, start_line, end_line, language, function_name)
@@ -137,18 +145,20 @@ class MetadataStore:
                 data,
             )
 
-        logger.info(f"Added {len(snippets)} snippets to metadata store")
+        logger.info("Added %d snippets to metadata store", len(snippets))
 
-    def get_snippet(self, snippet_id: int) -> Optional[Dict]:
-        """
-        Retrieve metadata for a single snippet.
+    def get_snippet(self, snippet_id: int) -> dict[str, Any] | None:
+        """Retrieve metadata for a single snippet.
 
         Args:
-            snippet_id: The snippet ID
+            snippet_id: The snippet ID.
 
         Returns:
-            Dictionary with snippet metadata, or None if not found
+            Dictionary with snippet metadata, or None if not found.
+
         """
+        if self.conn is None:
+            return None
         cursor = self.conn.execute(
             """
             SELECT id, code, file_path, start_line, end_line, language, function_name
@@ -164,44 +174,50 @@ class MetadataStore:
 
         return dict(row)
 
-    def get_snippets(self, snippet_ids: List[int]) -> List[Dict]:
-        """
-        Retrieve metadata for multiple snippets.
+    def get_snippets(self, snippet_ids: Sequence[int]) -> list[dict[str, Any]]:
+        """Retrieve metadata for multiple snippets.
 
         Args:
-            snippet_ids: List of snippet IDs
+            snippet_ids: List of snippet IDs.
 
         Returns:
-            List of dictionaries with snippet metadata
+            List of dictionaries with snippet metadata.
+
         """
-        if not snippet_ids:
+        if not snippet_ids or self.conn is None:
             return []
 
         placeholders = ",".join("?" * len(snippet_ids))
+        # Only `?` and `,` characters are interpolated; all user values are
+        # bound via the parameterized second argument, so this is not injectable.
         cursor = self.conn.execute(
             f"""
             SELECT id, code, file_path, start_line, end_line, language, function_name
             FROM snippets
             WHERE id IN ({placeholders})
             """,
-            snippet_ids,
+            list(snippet_ids),
         )
 
         return [dict(row) for row in cursor.fetchall()]
 
     def get_snippet_by_location(
-        self, file_path: str, line_number: int
-    ) -> Optional[Dict]:
-        """
-        Find a snippet by file location.
+        self,
+        file_path: str,
+        line_number: int,
+    ) -> dict[str, Any] | None:
+        """Find a snippet by file location.
 
         Args:
-            file_path: Path to the source file
-            line_number: Line number within the file
+            file_path: Path to the source file.
+            line_number: Line number within the file.
 
         Returns:
-            Dictionary with snippet metadata, or None if not found
+            Dictionary with snippet metadata, or None if not found.
+
         """
+        if self.conn is None:
+            return None
         cursor = self.conn.execute(
             """
             SELECT id, code, file_path, start_line, end_line, language, function_name
@@ -219,11 +235,15 @@ class MetadataStore:
 
     def count(self) -> int:
         """Get the total number of snippets in the store."""
+        if self.conn is None:
+            return 0
         cursor = self.conn.execute("SELECT COUNT(*) FROM snippets")
-        return cursor.fetchone()[0]
+        return int(cursor.fetchone()[0])
 
-    def get_languages(self) -> List[str]:
+    def get_languages(self) -> list[str]:
         """Get list of all languages in the store."""
+        if self.conn is None:
+            return []
         cursor = self.conn.execute("SELECT DISTINCT language FROM snippets")
         return [row[0] for row in cursor.fetchall()]
 
@@ -231,12 +251,18 @@ class MetadataStore:
         """Close the database connection."""
         if self.conn:
             self.conn.close()
+            self.conn = None
             logger.info("Closed metadata database connection")
 
-    def __enter__(self):
+    def __enter__(self) -> Self:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: object,
+    ) -> None:
         """Context manager exit."""
         self.close()

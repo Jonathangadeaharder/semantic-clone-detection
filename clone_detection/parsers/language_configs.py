@@ -1,31 +1,35 @@
-"""
-Language configurations for Tree-sitter parsing.
+"""Language configurations for Tree-sitter parsing.
 
 This module defines the S-expression queries and configurations for extracting
 functions and methods from various programming languages as specified in Table 1.1
 of the blueprint.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-@dataclass
+@dataclass(frozen=True)
 class LanguageConfig:
     """Configuration for a specific programming language."""
 
     name: str
-    extensions: List[str]
+    extensions: Sequence[str]
     grammar_module: str
     function_query: str
     capture_name: str = "function.definition"
 
 
 # Table 1.1: Tree-sitter Queries for Function Extraction
-LANGUAGE_CONFIGS = {
+LANGUAGE_CONFIGS: dict[str, LanguageConfig] = {
     "python": LanguageConfig(
         name="python",
-        extensions=[".py"],
+        extensions=(".py",),
         grammar_module="tree_sitter_python",
         function_query="""
             (function_definition
@@ -36,7 +40,7 @@ LANGUAGE_CONFIGS = {
     ),
     "javascript": LanguageConfig(
         name="javascript",
-        extensions=[".js", ".jsx", ".mjs"],
+        extensions=(".js", ".jsx", ".mjs"),
         grammar_module="tree_sitter_javascript",
         function_query="""
             [
@@ -49,7 +53,7 @@ LANGUAGE_CONFIGS = {
     ),
     "java": LanguageConfig(
         name="java",
-        extensions=[".java"],
+        extensions=(".java",),
         grammar_module="tree_sitter_java",
         function_query="""
             (method_declaration) @function.definition
@@ -58,7 +62,7 @@ LANGUAGE_CONFIGS = {
     ),
     "go": LanguageConfig(
         name="go",
-        extensions=[".go"],
+        extensions=(".go",),
         grammar_module="tree_sitter_go",
         function_query="""
             (function_declaration) @function.definition
@@ -67,7 +71,7 @@ LANGUAGE_CONFIGS = {
     ),
     "cpp": LanguageConfig(
         name="cpp",
-        extensions=[".cpp", ".cc", ".cxx", ".hpp", ".h"],
+        extensions=(".cpp", ".cc", ".cxx", ".hpp", ".h"),
         grammar_module="tree_sitter_cpp",
         function_query="""
             (function_definition) @function.definition
@@ -76,7 +80,7 @@ LANGUAGE_CONFIGS = {
     ),
     "csharp": LanguageConfig(
         name="csharp",
-        extensions=[".cs"],
+        extensions=(".cs",),
         grammar_module="tree_sitter_c_sharp",
         function_query="""
             (method_declaration) @function.definition
@@ -86,15 +90,15 @@ LANGUAGE_CONFIGS = {
 }
 
 
-def get_language_for_file(file_path: str) -> Optional[str]:
-    """
-    Determine the programming language based on file extension.
+def get_language_for_file(file_path: str) -> str | None:
+    """Determine the programming language based on file extension.
 
     Args:
-        file_path: Path to the source file
+        file_path: Path to the source file.
 
     Returns:
-        Language name if recognized, None otherwise
+        Language name if recognized, None otherwise.
+
     """
     file_path_lower = file_path.lower()
     for lang_name, config in LANGUAGE_CONFIGS.items():

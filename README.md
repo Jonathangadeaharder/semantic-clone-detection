@@ -9,9 +9,13 @@ This system implements the complete architecture described in "A Blueprint for S
 ### Key Features
 
 - **Semantic Understanding**: Detects functionally identical code that differs textually (Type-4 clones)
-- **Multi-Language Support**: Python, JavaScript, Java, Go, C++, C#
-- **Scalable Architecture**: Handles millions of functions using FAISS approximate nearest neighbor search
-- **Production-Ready**: GPU acceleration, batch processing, and threshold-based querying
+- **Multi-Language Parsing**: Python, JavaScript, Java, Go, C++, C# via Tree-sitter
+- **GraphCodeBERT Embeddings**: 768-dim vectors using the `<s>` token's last hidden state
+- **FAISS Indexing**: IndexFlatL2 (plugin server) / IndexIVFPQ (CLI builder) with L2-normalized vectors
+- **Range Search**: Threshold-based cosine-similarity search via L2 distance conversion
+- **CLI**: `clone-detect` ingest/search/info
+- **HTTP Server**: `plugin_server.py` FastAPI server
+- **Threshold Math**: Cosine↔L2 conversion utilities (unit-tested)
 
 ### Architecture
 
@@ -167,7 +171,6 @@ The system uses Tree-sitter to extract function-level code snippets from multipl
 - **Model**: `microsoft/graphcodebert-base`
 - **Embedding Dimension**: 768
 - **Extraction Method**: `<s>` token's last hidden state
-- **Fine-tuning**: Optional Triplet Margin Loss for improved similarity
 
 ### Part III: FAISS IndexIVFPQ
 
@@ -213,21 +216,6 @@ L2_distance = sqrt(2 - 2 * cosine_similarity)
 - Query latency: 5-15 ms (nprobe=16)
 - Throughput: 500-1000 queries/second
 
-## Evaluation
-
-The system can be evaluated on standard benchmarks:
-
-```bash
-clone-detect evaluate \
-    --benchmark bigclonebench \
-    --index clones.index \
-    --output-report report.json
-```
-
-**Supported Benchmarks**:
-- BigCloneBench (BCB)
-- SemanticCloneBench (SCB)
-
 ## API Reference
 
 ### TreeSitterParser
@@ -252,13 +240,13 @@ embeddings = embedder.embed_batch(code_snippets)
 builder = FAISSIndexBuilder(dimension=768, nlist=4096)
 builder.train(training_vectors)
 builder.add(all_vectors, ids)
-index = builder.save("index.faiss")
+builder.save("index.faiss")
 ```
 
 ### CloneSearcher
 
 ```python
-searcher = CloneSearcher(index, embedder, metadata_db)
+searcher = CloneSearcher(index, embedder, metadata_store)
 clones = searcher.find_clones(
     query_code="def foo(): pass",
     similarity_threshold=0.95
@@ -268,42 +256,23 @@ clones = searcher.find_clones(
 
 ## Advanced Usage
 
-### Fine-Tuning GraphCodeBERT
-
-For optimal results, fine-tune the model on your domain:
-
-```bash
-clone-detect train \
-    --dataset bigclonebench \
-    --output-model ./fine-tuned-model \
-    --epochs 10 \
-    --batch-size 32
-```
-
 ### Index Optimization
 
-Tune `nprobe` for your accuracy/speed requirements:
+Tune `nprobe` for your accuracy/speed requirements via the builder:
 
 ```python
-index.nprobe = 32  # Higher = more accurate, slower
+builder.set_nprobe(32)  # Higher = more accurate, slower
 ```
 
-### Sharded Index for Billion-Scale
+## Entry Points
 
-```bash
-clone-detect ingest \
-    --source-dir /path/to/codebase \
-    --index-output clones.index \
-    --shard-count 10 \
-    --shard-size 100000000
-```
-
-## Limitations
-
-1. **Token Limit**: Functions > 512 tokens are truncated
-2. **Static Index**: Requires rebuild for new code (not incremental)
-3. **Memory**: Large codebases require significant RAM during indexing
-4. **Accuracy**: IndexIVFPQ is approximate (~98-99% recall vs. exact search)
+- **`plugin_server.py`** — FastAPI HTTP server. Builds a flat (`IndexFlatL2`)
+  FAISS index in memory from parsed functions and serves range-search queries
+  over them.
+- **`clone_detection/cli/main.py`** — CLI with three commands: `ingest`
+  (parse → embed → train `IndexIVFPQ` → save index + metadata DB), `search`
+  (load index + DB, range-search a query function), and `info` (print index
+  stats).
 
 ## Architecture Diagram
 

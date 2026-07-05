@@ -1,5 +1,4 @@
-"""
-Part III: Architecting the High-Scale Vector Index with FAISS
+"""Part III: Architecting the High-Scale Vector Index with FAISS.
 
 FAISS-based vector indexing for efficient similarity search at scale.
 """
