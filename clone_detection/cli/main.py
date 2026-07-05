@@ -1,14 +1,15 @@
-"""
-Main CLI entry point for the semantic clone detection system.
+"""Main CLI entry point for the semantic clone detection system.
 
 Implements the command-line interface for both Blueprint A (Batch Ingestion)
 and Blueprint B (Query Pipeline).
 """
 
+from __future__ import annotations
+
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import TYPE_CHECKING
 
 import click
 import numpy as np
@@ -16,18 +17,42 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
 
-from clone_detection.embeddings.graphcodebert import GraphCodeBERTEmbedder
 from clone_detection.indexing.faiss_index import FAISSIndexBuilder, IndexType
 from clone_detection.parsers.tree_sitter_parser import TreeSitterParser
 from clone_detection.query.metadata import MetadataStore
 from clone_detection.query.search import CloneSearcher
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from clone_detection.embeddings.graphcodebert import GraphCodeBERTEmbedder
+
 console = Console()
 logger = logging.getLogger(__name__)
 
 
+def _get_embedder_class() -> type[GraphCodeBERTEmbedder]:
+    """Return ``GraphCodeBERTEmbedder`` imported lazily.
+
+    The embedder pulls in ``torch`` and ``transformers``, which are heavy and
+    — under faiss-cpu — can corrupt faiss's OpenMP runtime when both shared
+    libraries are loaded eagerly in the same process. Deferring the import
+    until a command actually needs the model keeps the CLI module importable
+    without the ML stack and lets tests substitute a fake embedder before
+    torch is ever loaded.
+    """
+    from clone_detection.embeddings.graphcodebert import GraphCodeBERTEmbedder
+
+    return GraphCodeBERTEmbedder
+
+
 def setup_logging(verbose: bool) -> None:
-    """Configure logging based on verbosity level."""
+    """Configure logging based on verbosity level.
+
+    Args:
+        verbose: If True, set log level to DEBUG; otherwise INFO.
+
+    """
     level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -38,14 +63,12 @@ def setup_logging(verbose: bool) -> None:
 
 @click.group()
 @click.version_option(version="0.1.0")
-def cli():
-    """
-    Semantic Code Clone Detection using GraphCodeBERT and FAISS.
+def cli() -> None:
+    """Semantic Code Clone Detection using GraphCodeBERT and FAISS.
 
     A production-grade system for detecting Type-4 (semantic) code clones
     across multiple programming languages.
     """
-    pass
 
 
 @cli.command()
@@ -117,6 +140,12 @@ def cli():
     help="Maximum number of files to process (for testing)",
 )
 @click.option(
+    "--seed",
+    default=42,
+    type=int,
+    help="Random seed for IVF training-vector sampling (default: 42)",
+)
+@click.option(
     "--verbose",
     "-v",
     is_flag=True,
@@ -127,18 +156,18 @@ def ingest(
     index_output: str,
     metadata_db: str,
     languages: str,
-    exclude: tuple,
+    exclude: Sequence[str],
     model: str,
-    device: Optional[str],
+    device: str | None,
     batch_size: int,
     nlist: int,
     nprobe: int,
     use_gpu: bool,
-    max_files: Optional[int],
+    max_files: int | None,
+    seed: int,
     verbose: bool,
-):
-    """
-    Ingest and index a codebase (Blueprint A: Batch Ingestion Pipeline).
+) -> None:
+    r"""Ingest and index a codebase (Blueprint A: Batch Ingestion Pipeline).
 
     This command implements the complete batch ingestion pipeline:
     1. Parse the codebase with Tree-sitter
@@ -147,18 +176,20 @@ def ingest(
     4. Save index and metadata
 
     Example:
-        clone-detect ingest --source-dir /path/to/repo --index-output clones.index --metadata-db clones.db
+        clone-detect ingest --source-dir /path/to/repo \\
+            --index-output clones.index --metadata-db clones.db
+
     """
     setup_logging(verbose)
 
     console.print("[bold blue]Semantic Clone Detection - Batch Ingestion[/bold blue]")
     console.print()
 
-    # Parse language list
+    # Parse language list.
     lang_list = [lang.strip() for lang in languages.split(",")]
 
     try:
-        # Step 1: Parse codebase
+        # Step 1: Parse codebase.
         console.print("[bold]Step 1/4:[/bold] Parsing codebase with Tree-sitter")
         parser = TreeSitterParser(languages=lang_list)
 
@@ -167,22 +198,28 @@ def ingest(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Parsing source files...", total=None)
+            progress.add_task("Parsing source files...", total=None)
             snippets = parser.parse_directory(
-                source_dir, exclude_patterns=list(exclude), max_files=max_files
+                source_dir,
+                exclude_patterns=list(exclude),
+                max_files=max_files,
             )
 
-        console.print(f"✓ Parsed {len(snippets)} function snippets")
+        console.print(f"\u2713 Parsed {len(snippets)} function snippets")
         console.print()
 
         if len(snippets) == 0:
-            console.print("[red]No code snippets found. Check language settings and exclusions.[/red]")
+            console.print(
+                "[red]No code snippets found. Check language settings and exclusions.[/red]",
+            )
             sys.exit(1)
 
-        # Step 2: Generate embeddings
+        # Step 2: Generate embeddings.
         console.print("[bold]Step 2/4:[/bold] Generating GraphCodeBERT embeddings")
-        embedder = GraphCodeBERTEmbedder(
-            model_name=model, device=device, batch_size=batch_size
+        embedder = _get_embedder_class()(
+            model_name=model,
+            device=device,
+            batch_size=batch_size,
         )
 
         with Progress(
@@ -190,21 +227,28 @@ def ingest(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task(f"Embedding {len(snippets)} snippets...", total=None)
+            progress.add_task(f"Embedding {len(snippets)} snippets...", total=None)
             embeddings = embedder.embed_batch(snippets)
 
-        console.print(f"✓ Generated {embeddings.shape[0]} embeddings (dim={embeddings.shape[1]})")
+        console.print(
+            f"\u2713 Generated {embeddings.shape[0]} embeddings (dim={embeddings.shape[1]})",
+        )
         console.print()
 
-        # Step 3: Build FAISS index
+        # Step 3: Build FAISS index.
         console.print("[bold]Step 3/4:[/bold] Building FAISS index")
 
-        # Generate IDs
+        # Generate IDs.
         ids = np.arange(len(snippets), dtype=np.int64)
 
-        # Create and train index
+        # Derive the embedding dimension from the embedder rather than
+        # hardcoding 768: this keeps the index consistent with whatever model
+        # was configured (and lets tests substitute a smaller fake embedder).
+        embedding_dimension = embedder.get_embedding_dimension()
+
+        # Create and train index.
         index_builder = FAISSIndexBuilder(
-            dimension=768,
+            dimension=embedding_dimension,
             index_type=IndexType.IVF_PQ,
             nlist=nlist,
             m=64,
@@ -218,11 +262,12 @@ def ingest(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Training index...", total=None)
+            progress.add_task("Training index...", total=None)
 
-            # Use first 100k vectors for training (or all if fewer)
+            # Use first 100k vectors for training (or all if fewer).
             train_size = min(100000, len(embeddings))
-            train_indices = np.random.choice(len(embeddings), train_size, replace=False)
+            rng = np.random.default_rng(seed)
+            train_indices = rng.choice(len(embeddings), train_size, replace=False)
             train_vectors = embeddings[train_indices]
 
             index_builder.train(train_vectors)
@@ -232,29 +277,29 @@ def ingest(
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("Adding vectors to index...", total=None)
+            progress.add_task("Adding vectors to index...", total=None)
             index_builder.add(embeddings, ids)
 
-        console.print(f"✓ Built index with {index_builder.index.ntotal} vectors")
+        console.print(f"\u2713 Built index with {index_builder.index.ntotal} vectors")
         console.print()
 
-        # Step 4: Save index and metadata
+        # Step 4: Save index and metadata.
         console.print("[bold]Step 4/4:[/bold] Saving index and metadata")
 
-        # Save FAISS index
+        # Save FAISS index.
         index_builder.save(index_output)
-        console.print(f"✓ Saved FAISS index to {index_output}")
+        console.print(f"\u2713 Saved FAISS index to {index_output}")
 
-        # Save metadata
+        # Save metadata.
         metadata_store = MetadataStore(metadata_db)
         snippet_tuples = [(i, snippet) for i, snippet in enumerate(snippets)]
         metadata_store.add_snippets_batch(snippet_tuples)
         metadata_store.close()
-        console.print(f"✓ Saved metadata to {metadata_db}")
+        console.print(f"\u2713 Saved metadata to {metadata_db}")
         console.print()
 
-        # Summary
-        console.print("[bold green]✓ Ingestion complete![/bold green]")
+        # Summary.
+        console.print("[bold green]\u2713 Ingestion complete![/bold green]")
         console.print(f"  Total snippets: {len(snippets)}")
         console.print(f"  Languages: {', '.join(lang_list)}")
         console.print(f"  Index type: IndexIVFPQ (nlist={nlist}, nprobe={nprobe})")
@@ -331,21 +376,22 @@ def ingest(
 def search(
     index: str,
     metadata_db: str,
-    query_code: Optional[str],
-    query_file: Optional[str],
-    line_number: Optional[int],
+    query_code: str | None,
+    query_file: str | None,
+    line_number: int | None,
     similarity: float,
     max_results: int,
     model: str,
-    device: Optional[str],
+    device: str | None,
     use_gpu: bool,
     verbose: bool,
-):
-    """
-    Search for semantic clones (Blueprint B: Query Pipeline).
+) -> None:
+    r"""Search for semantic clones (Blueprint B: Query Pipeline).
 
     Example:
-        clone-detect search --index clones.index --metadata-db clones.db --query-code "def add(a, b): return a + b"
+        clone-detect search --index clones.index --metadata-db clones.db \\
+            --query-code "def add(a, b): return a + b"
+
     """
     setup_logging(verbose)
 
@@ -353,41 +399,48 @@ def search(
     console.print()
 
     try:
-        # Validate inputs
+        # Validate inputs.
         if not query_code and not query_file:
-            console.print("[red]Error: Either --query-code or --query-file must be provided[/red]")
+            console.print(
+                "[red]Error: Either --query-code or --query-file must be provided[/red]",
+            )
             sys.exit(1)
 
-        # Load components
+        # Load components.
         console.print("Loading index and model...")
 
-        # Load FAISS index
+        # Load FAISS index.
         index_builder = FAISSIndexBuilder.load(index, use_gpu=use_gpu)
         faiss_index = index_builder.index
 
-        # Load embedder
-        embedder = GraphCodeBERTEmbedder(model_name=model, device=device)
+        # Load embedder.
+        embedder = _get_embedder_class()(model_name=model, device=device)
 
-        # Load metadata
+        # Load metadata.
         metadata_store = MetadataStore(metadata_db)
 
-        # Create searcher
+        # Create searcher.
         searcher = CloneSearcher(faiss_index, embedder, metadata_store)
 
-        console.print(f"✓ Loaded index with {faiss_index.ntotal} code snippets")
+        console.print(f"\u2713 Loaded index with {faiss_index.ntotal} code snippets")
         console.print()
 
-        # Determine query code
+        # Determine query code.
         if query_file:
             if line_number is not None:
-                # Search by file location
-                console.print(f"Searching for clones of function at {query_file}:{line_number}")
+                # Search by file location.
+                console.print(
+                    f"Searching for clones of function at {query_file}:{line_number}",
+                )
                 clones = searcher.find_clones_by_location(
-                    query_file, line_number, similarity, max_results
+                    query_file,
+                    line_number,
+                    similarity,
+                    max_results,
                 )
             else:
-                # Read entire file as query
-                with open(query_file, "r") as f:
+                # Read entire file as query.
+                with Path(query_file).open() as f:
                     query_code = f.read()
                 console.print(f"Searching for clones of code in {query_file}")
                 clones = searcher.find_clones(query_code, similarity, max_results)
@@ -397,9 +450,11 @@ def search(
 
         console.print()
 
-        # Display results
+        # Display results.
         if not clones:
-            console.print(f"[yellow]No clones found with similarity >= {similarity:.2f}[/yellow]")
+            console.print(
+                f"[yellow]No clones found with similarity >= {similarity:.2f}[/yellow]",
+            )
         else:
             console.print(f"[bold green]Found {len(clones)} clones:[/bold green]")
             console.print()
@@ -444,22 +499,22 @@ def search(
     type=click.Path(exists=True),
     help="Path to the metadata database",
 )
-def info(index: str, metadata_db: str):
-    """
-    Display information about a built index.
+def info(index: str, metadata_db: str) -> None:
+    """Display information about a built index.
 
     Example:
         clone-detect info --index clones.index --metadata-db clones.db
+
     """
     console.print("[bold blue]Index Information[/bold blue]")
     console.print()
 
     try:
-        # Load index
+        # Load index.
         index_builder = FAISSIndexBuilder.load(index)
         stats = index_builder.get_stats()
 
-        # Load metadata
+        # Load metadata.
         metadata_store = MetadataStore(metadata_db)
 
         table = Table(show_header=False)

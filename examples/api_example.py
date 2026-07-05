@@ -1,38 +1,41 @@
-"""
-Example: Using the Python API for semantic clone detection.
+"""Example: Using the Python API for semantic clone detection.
 
 This example demonstrates how to use the clone detection system programmatically
 without the CLI.
 """
 
-from clone_detection.parsers import TreeSitterParser
+from pathlib import Path
+
+import numpy as np
+
 from clone_detection.embeddings import GraphCodeBERTEmbedder
 from clone_detection.indexing import FAISSIndexBuilder, IndexType
+from clone_detection.parsers import TreeSitterParser
 from clone_detection.query import CloneSearcher, MetadataStore
 
 
-def main():
+def main() -> None:
+    """Run the Python API example end-to-end."""
     print("=" * 70)
     print("Semantic Clone Detection - Python API Example")
     print("=" * 70)
     print()
 
-    # Step 1: Parse code snippets
+    # Step 1: Parse code snippets.
     print("Step 1: Parsing code with Tree-sitter...")
     parser = TreeSitterParser(languages=["python"])
 
-    # Example: Parse a single file or directory
+    # Example: Parse a single file or directory.
     snippets = parser.parse_file("example_code.py")
-    # Or: snippets = parser.parse_directory("/path/to/codebase")
 
     print(f"  Found {len(snippets)} code snippets")
     print()
 
-    # Step 2: Generate embeddings
+    # Step 2: Generate embeddings.
     print("Step 2: Generating GraphCodeBERT embeddings...")
     embedder = GraphCodeBERTEmbedder(
         model_name="microsoft/graphcodebert-base",
-        device="cpu",  # Use "cuda" for GPU
+        device="cpu",  # Use "cuda" for GPU.
         batch_size=8,
     )
 
@@ -40,46 +43,46 @@ def main():
     print(f"  Generated embeddings: shape={embeddings.shape}")
     print()
 
-    # Step 3: Build FAISS index
+    # Step 3: Build FAISS index.
     print("Step 3: Building FAISS index...")
     index_builder = FAISSIndexBuilder(
         dimension=768,
         index_type=IndexType.IVF_PQ,
-        nlist=256,  # Smaller for this example
+        nlist=256,  # Smaller for this example.
         nprobe=8,
     )
 
-    # Generate IDs for snippets
-    import numpy as np
-
+    # Generate IDs for snippets.
     snippet_ids = np.arange(len(snippets), dtype=np.int64)
 
-    # Build the index (train + add)
+    # Build the index (train + add).
     index = index_builder.build(vectors=embeddings, ids=snippet_ids)
     print(f"  Built index with {index.ntotal} vectors")
     print()
 
-    # Step 4: Save index and metadata
+    # Step 4: Save index and metadata.
     print("Step 4: Saving index and metadata...")
     index_builder.save("example_clones.index")
 
-    # Save metadata
+    # Save metadata.
     metadata_store = MetadataStore("example_clones.db")
     for i, snippet in enumerate(snippets):
         metadata_store.add_snippet(i, snippet)
     print("  Saved to example_clones.index and example_clones.db")
     print()
 
-    # Step 5: Query for clones
+    # Step 5: Query for clones.
     print("Step 5: Searching for clones...")
 
-    # Reload for demonstration (in practice, you'd do this in a separate session)
+    # Reload for demonstration (in practice, you'd do this in a separate session).
     index_builder_loaded = FAISSIndexBuilder.load("example_clones.index")
     searcher = CloneSearcher(
-        index=index_builder_loaded.index, embedder=embedder, metadata_store=metadata_store
+        index=index_builder_loaded.index,
+        embedder=embedder,
+        metadata_store=metadata_store,
     )
 
-    # Example query
+    # Example query.
     query_code = """
 def calculate_sum(numbers):
     total = 0
@@ -89,11 +92,13 @@ def calculate_sum(numbers):
 """
 
     clones = searcher.find_clones(
-        query_code=query_code, similarity_threshold=0.80, max_results=10
+        query_code=query_code,
+        similarity_threshold=0.80,
+        max_results=10,
     )
 
     print(f"  Found {len(clones)} potential clones")
-    for i, clone in enumerate(clones[:5], 1):  # Show top 5
+    for i, clone in enumerate(clones[:5], 1):  # Show top 5.
         print(f"    {i}. {clone.file_path}:{clone.start_line} (sim={clone.similarity:.3f})")
 
     print()
@@ -105,10 +110,10 @@ def calculate_sum(numbers):
 
 
 if __name__ == "__main__":
-    # Note: This is a minimal example. In practice, you'd have actual code files to parse.
-    # For this example to run, create an 'example_code.py' file with some Python functions.
+    # Note: This is a minimal example. In practice, you'd have actual code files.
+    # For this example to run, create an 'example_code.py' file with Python functions.
 
-    # Create a sample file for demonstration
+    # Create a sample file for demonstration.
     sample_code = '''
 def add(a, b):
     """Add two numbers."""
@@ -138,15 +143,13 @@ def compute_total(values):
     return sum_val
 '''
 
-    with open("example_code.py", "w") as f:
-        f.write(sample_code)
+    Path("example_code.py").write_text(sample_code)
 
     try:
         main()
     finally:
-        # Cleanup
-        import os
-
-        for file in ["example_code.py", "example_clones.index", "example_clones.db"]:
-            if os.path.exists(file):
-                os.remove(file)
+        # Cleanup.
+        for filename in ("example_code.py", "example_clones.index", "example_clones.db"):
+            p = Path(filename)
+            if p.exists():
+                p.unlink()

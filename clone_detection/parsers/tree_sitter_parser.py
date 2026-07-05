@@ -1,18 +1,21 @@
-"""
-Tree-sitter-based code parser for extracting function-level code snippets.
+"""Tree-sitter-based code parser for extracting function-level code snippets.
 
 This module implements Part I of the blueprint: Ingestion & Parsing.
 It uses Tree-sitter to parse source code files and extract discrete,
 semantically-coherent units (functions and methods) across multiple languages.
 """
 
+from __future__ import annotations
+
 import importlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import TYPE_CHECKING
 
-from tree_sitter import Language, Parser, Tree
+from pathspec import PathSpec
+from pathspec.patterns import GitWildMatchPattern
+from tree_sitter import Language, Node, Parser, Query, QueryCursor
 
 from clone_detection.parsers.language_configs import (
     LANGUAGE_CONFIGS,
@@ -20,21 +23,24 @@ from clone_detection.parsers.language_configs import (
     get_language_for_file,
 )
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class CodeSnippet:
-    """
-    Represents a parsed code snippet with metadata.
+    """Represents a parsed code snippet with metadata.
 
     Attributes:
-        code: The raw source code of the function
-        file_path: Path to the source file
-        start_line: Starting line number (1-indexed)
-        end_line: Ending line number (1-indexed)
-        language: Programming language
-        function_name: Optional name of the function
+        code: The raw source code of the function.
+        file_path: Path to the source file.
+        start_line: Starting line number (1-indexed).
+        end_line: Ending line number (1-indexed).
+        language: Programming language.
+        function_name: Optional name of the function.
+
     """
 
     code: str
@@ -42,9 +48,10 @@ class CodeSnippet:
     start_line: int
     end_line: int
     language: str
-    function_name: Optional[str] = None
+    function_name: str | None = None
 
     def __repr__(self) -> str:
+        """Return a concise, human-readable representation of the snippet."""
         return (
             f"CodeSnippet(file={self.file_path}, "
             f"lines={self.start_line}-{self.end_line}, "
@@ -52,7 +59,7 @@ class CodeSnippet:
             f"name={self.function_name})"
         )
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary for serialization."""
         return {
             "code": self.code,
@@ -65,8 +72,7 @@ class CodeSnippet:
 
 
 class TreeSitterParser:
-    """
-    Multi-language code parser using Tree-sitter.
+    """Multi-language code parser using Tree-sitter.
 
     This parser implements the extraction strategy described in Section 1.3
     of the blueprint, using S-expression queries to find function definitions
@@ -76,172 +82,183 @@ class TreeSitterParser:
         >>> parser = TreeSitterParser(languages=["python", "java"])
         >>> snippets = parser.parse_file("example.py")
         >>> print(f"Found {len(snippets)} functions")
+
     """
 
-    def __init__(self, languages: Optional[List[str]] = None):
-        """
-        Initialize the parser with specified languages.
+    def __init__(self, languages: Sequence[str] | None = None) -> None:
+        """Initialize the parser with specified languages.
 
         Args:
             languages: List of language names to support. If None, all available
-                      languages are enabled.
+                languages are enabled.
+
         """
-        self.enabled_languages = languages or list(LANGUAGE_CONFIGS.keys())
-        self.parsers: Dict[str, Parser] = {}
-        self.queries: Dict[str, object] = {}
+        self.enabled_languages: list[str] = (
+            list(languages) if languages else list(LANGUAGE_CONFIGS.keys())
+        )
+        self.parsers: dict[str, Parser] = {}
+        self.queries: dict[str, Query] = {}
+        self._configs: dict[str, LanguageConfig] = {}
 
         self._initialize_parsers()
 
     def _initialize_parsers(self) -> None:
-        """
-        Load Tree-sitter grammars and compile queries for each enabled language.
+        """Load Tree-sitter grammars and compile queries for each enabled language.
 
         This implements the initialization described in Section 1.3.
         """
         for lang_name in self.enabled_languages:
             if lang_name not in LANGUAGE_CONFIGS:
-                logger.warning(f"Unknown language: {lang_name}, skipping")
+                logger.warning("Unknown language: %s, skipping", lang_name)
                 continue
 
             config = LANGUAGE_CONFIGS[lang_name]
 
             try:
-                # Dynamically import the language grammar module
-                # e.g., "tree_sitter_python" -> tree_sitter_python.language()
+                # Dynamically import the language grammar module.
                 grammar_module = importlib.import_module(config.grammar_module)
-                language_func = grammar_module.language
-                language = Language(language_func())
+                language = Language(grammar_module.language())
 
-                # Create parser
+                # Create parser and compile the S-expression query.
                 parser = Parser(language)
+                query = Query(language, config.function_query)
+
                 self.parsers[lang_name] = parser
-
-                # Compile the S-expression query
-                query = language.query(config.function_query)
                 self.queries[lang_name] = query
+                self._configs[lang_name] = config
 
-                logger.info(f"Initialized parser for {lang_name}")
-
-            except ImportError as e:
-                logger.error(
-                    f"Failed to import grammar for {lang_name}: {e}. "
-                    f"Install with: pip install {config.grammar_module.replace('_', '-')}"
+                logger.info("Initialized parser for %s", lang_name)
+            except ImportError:
+                logger.exception(
+                    "Failed to import grammar for %s. Install with: uv add %s",
+                    lang_name,
+                    config.grammar_module.replace("_", "-"),
                 )
-            except Exception as e:
-                logger.error(f"Failed to initialize parser for {lang_name}: {e}")
+            except Exception:
+                logger.exception("Failed to initialize parser for %s", lang_name)
 
-    def parse_file(self, file_path: str) -> List[CodeSnippet]:
-        """
-        Parse a single source file and extract all function snippets.
+    def parse_file(self, file_path: str) -> list[CodeSnippet]:
+        """Parse a single source file and extract all function snippets.
 
         Args:
-            file_path: Path to the source code file
+            file_path: Path to the source code file.
 
         Returns:
-            List of extracted code snippets
+            List of extracted code snippets.
 
         Example:
             >>> parser = TreeSitterParser(languages=["python"])
             >>> snippets = parser.parse_file("my_module.py")
-        """
-        file_path = str(Path(file_path).resolve())
 
-        # Determine language from file extension
-        lang_name = get_language_for_file(file_path)
+        """
+        resolved_path = str(Path(file_path).resolve())
+
+        # Determine language from file extension.
+        lang_name = get_language_for_file(resolved_path)
         if lang_name is None:
-            logger.debug(f"Unsupported file type: {file_path}")
+            logger.debug("Unsupported file type: %s", resolved_path)
             return []
 
         if lang_name not in self.parsers:
-            logger.debug(f"Parser not initialized for {lang_name}: {file_path}")
+            logger.debug(
+                "Parser not initialized for %s: %s",
+                lang_name,
+                resolved_path,
+            )
             return []
 
-        # Read file content
+        # Read file content.
         try:
-            with open(file_path, "rb") as f:
+            with Path(resolved_path).open("rb") as f:
                 source_bytes = f.read()
-        except Exception as e:
-            logger.error(f"Failed to read file {file_path}: {e}")
+        except OSError:
+            logger.exception("Failed to read file %s", resolved_path)
             return []
 
-        return self._parse_source(source_bytes, file_path, lang_name)
+        return self._parse_source(source_bytes, resolved_path, lang_name)
 
     def _parse_source(
-        self, source_bytes: bytes, file_path: str, lang_name: str
-    ) -> List[CodeSnippet]:
-        """
-        Parse source code bytes and extract function snippets.
+        self,
+        source_bytes: bytes,
+        file_path: str,
+        lang_name: str,
+    ) -> list[CodeSnippet]:
+        """Parse source code bytes and extract function snippets.
 
         This implements the extraction logic from Section 1.3:
-        1. Parse the file into an AST
-        2. Run the S-expression query
-        3. Extract function metadata and code
+        1. Parse the file into an AST.
+        2. Run the S-expression query.
+        3. Extract function metadata and code.
 
         Args:
-            source_bytes: Raw source code as bytes
-            file_path: Path to the source file
-            lang_name: Programming language name
+            source_bytes: Raw source code as bytes.
+            file_path: Path to the source file.
+            lang_name: Programming language name.
 
         Returns:
-            List of extracted code snippets
+            List of extracted code snippets.
+
         """
         parser = self.parsers[lang_name]
         query = self.queries[lang_name]
-        config = LANGUAGE_CONFIGS[lang_name]
+        config = self._configs[lang_name]
 
-        # Parse the source code
-        tree: Tree = parser.parse(source_bytes)
+        # Parse the source code.
+        tree = parser.parse(source_bytes)
 
-        # Run the query to find all function definitions
-        captures = query.captures(tree.root_node)
+        # Run the query to find all function definitions.
+        cursor = QueryCursor(query)
+        captures = cursor.captures(tree.root_node)
 
-        snippets = []
-        for node, capture_name in captures:
-            if capture_name == config.capture_name:
-                # Extract the raw text of the function
-                function_code = node.text.decode("utf8")
+        # In tree-sitter 0.25+, captures() returns a dict mapping capture name
+        # to a list of nodes. The nodes are NOT guaranteed to be in source
+        # order (the cursor yields them in match order, which can differ for
+        # nested/overlapping captures), so we sort by start byte to present
+        # snippets in the order they appear in the file.
+        definition_nodes = sorted(captures.get(config.capture_name, []), key=lambda n: n.start_byte)
 
-                # Extract metadata
-                # Note: start_point and end_point are 0-indexed (row, column)
-                # We add 1 to convert to 1-indexed line numbers
-                start_line = node.start_point[0] + 1
-                end_line = node.end_point[0] + 1
+        snippets: list[CodeSnippet] = []
+        for node in definition_nodes:
+            function_code = node.text.decode("utf8")
 
-                # Try to extract function name (if available in captures)
-                function_name = self._extract_function_name(node, source_bytes)
+            # start_point/end_point are 0-indexed (row, column); convert to
+            # 1-indexed line numbers.
+            start_line = node.start_point[0] + 1
+            end_line = node.end_point[0] + 1
 
-                snippet = CodeSnippet(
-                    code=function_code,
-                    file_path=file_path,
-                    start_line=start_line,
-                    end_line=end_line,
-                    language=lang_name,
-                    function_name=function_name,
-                )
-                snippets.append(snippet)
+            function_name = self._extract_function_name(node)
 
-        logger.debug(f"Extracted {len(snippets)} functions from {file_path}")
+            snippet = CodeSnippet(
+                code=function_code,
+                file_path=file_path,
+                start_line=start_line,
+                end_line=end_line,
+                language=lang_name,
+                function_name=function_name,
+            )
+            snippets.append(snippet)
+
+        logger.debug("Extracted %d functions from %s", len(snippets), file_path)
         return snippets
 
-    def _extract_function_name(self, node, source_bytes: bytes) -> Optional[str]:
-        """
-        Extract the function name from a function definition node.
+    def _extract_function_name(self, node: Node) -> str | None:
+        """Extract the function name from a function definition node.
 
         Args:
-            node: Tree-sitter node representing the function
-            source_bytes: Source code bytes
+            node: Tree-sitter node representing the function.
 
         Returns:
-            Function name if found, None otherwise
+            Function name if found, None otherwise.
+
         """
-        # Look for a child node of type "identifier" or "name"
+        # Look for a child node of type "identifier" or "name".
         for child in node.children:
-            if child.type in ["identifier", "name"]:
+            if child.type in ("identifier", "name"):
                 return child.text.decode("utf8")
 
-            # Recursive search in case the name is nested
+            # Recursive search in case the name is nested.
             for subchild in child.children:
-                if subchild.type in ["identifier", "name"]:
+                if subchild.type in ("identifier", "name"):
                     return subchild.text.decode("utf8")
 
         return None
@@ -249,22 +266,21 @@ class TreeSitterParser:
     def parse_directory(
         self,
         directory: str,
-        exclude_patterns: Optional[List[str]] = None,
-        max_files: Optional[int] = None,
-    ) -> List[CodeSnippet]:
-        """
-        Recursively parse all source files in a directory.
+        exclude_patterns: Sequence[str] | None = None,
+        max_files: int | None = None,
+    ) -> list[CodeSnippet]:
+        """Recursively parse all source files in a directory.
 
         This implements the "CodebaseWalker" component from Blueprint A
         (Batch Ingestion Pipeline).
 
         Args:
-            directory: Root directory to scan
-            exclude_patterns: List of glob patterns to exclude (e.g., "*.test.py")
-            max_files: Maximum number of files to process (for testing)
+            directory: Root directory to scan.
+            exclude_patterns: List of glob patterns to exclude (e.g., "*.test.py").
+            max_files: Maximum number of files to process (for testing).
 
         Returns:
-            List of all extracted code snippets
+            List of all extracted code snippets.
 
         Example:
             >>> parser = TreeSitterParser(languages=["python"])
@@ -272,55 +288,56 @@ class TreeSitterParser:
             ...     "/path/to/codebase",
             ...     exclude_patterns=["**/test_*.py", "**/__pycache__/**"]
             ... )
+
         """
-        from pathspec import PathSpec
-        from pathspec.patterns import GitWildMatchPattern
-
-        # Build exclusion pathspec
-        exclude_spec = None
+        # Build exclusion pathspec.
+        exclude_spec: PathSpec | None = None
         if exclude_patterns:
-            exclude_spec = PathSpec.from_lines(GitWildMatchPattern, exclude_patterns)
+            exclude_spec = PathSpec.from_lines(
+                GitWildMatchPattern,
+                list(exclude_patterns),
+            )
 
-        # Collect supported file extensions
-        supported_extensions: Set[str] = set()
+        # Collect supported file extensions.
+        supported_extensions: set[str] = set()
         for lang_name in self.enabled_languages:
             if lang_name in LANGUAGE_CONFIGS:
-                supported_extensions.update(LANGUAGE_CONFIGS[lang_name].extensions)
+                supported_extensions.update(
+                    ext.lower() for ext in LANGUAGE_CONFIGS[lang_name].extensions
+                )
 
-        # Walk directory and collect files
-        all_snippets = []
+        # Walk directory and collect files.
+        all_snippets: list[CodeSnippet] = []
         file_count = 0
 
         root_path = Path(directory).resolve()
         for file_path in root_path.rglob("*"):
-            # Skip directories
+            # Skip directories.
             if not file_path.is_file():
                 continue
 
-            # Check if file has a supported extension
-            if not any(str(file_path).endswith(ext) for ext in supported_extensions):
+            # Check if file has a supported extension (case-insensitive).
+            if file_path.suffix.lower() not in supported_extensions:
                 continue
 
-            # Check exclusion patterns
+            # Check exclusion patterns.
             relative_path = file_path.relative_to(root_path)
             if exclude_spec and exclude_spec.match_file(str(relative_path)):
-                logger.debug(f"Excluded: {relative_path}")
+                logger.debug("Excluded: %s", relative_path)
                 continue
 
-            # Parse file
+            # Parse file.
             snippets = self.parse_file(str(file_path))
             all_snippets.extend(snippets)
 
             file_count += 1
             if max_files and file_count >= max_files:
-                logger.info(f"Reached max_files limit: {max_files}")
+                logger.info("Reached max_files limit: %d", max_files)
                 break
 
         logger.info(
-            f"Parsed {file_count} files, extracted {len(all_snippets)} function snippets"
+            "Parsed %d files, extracted %d function snippets",
+            file_count,
+            len(all_snippets),
         )
         return all_snippets
-
-    def get_supported_languages(self) -> List[str]:
-        """Get list of languages with initialized parsers."""
-        return list(self.parsers.keys())
